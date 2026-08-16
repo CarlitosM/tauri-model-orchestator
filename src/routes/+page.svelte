@@ -1,6 +1,8 @@
 <script lang="ts">
+	import { invoke } from '@tauri-apps/api/core';
 	import { emit } from '@tauri-apps/api/event';
 	import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
+	import { onMount } from 'svelte';
 
 	type EchoRequest = {
 		requestId: string;
@@ -11,12 +13,21 @@
 		receivedAt: number;
 	};
 
+	type OllamaModel = {
+		name: string;
+		size: number;
+		modifiedAt: string;
+	};
+
 	let message = $state('');
 	let response = $state<EchoResponse>();
 	let listenerReady = $state(false);
 	let isPending = $state(false);
 	let error = $state<string>();
 	let requestNumber = 0;
+	let models = $state<OllamaModel[]>([]);
+	let modelsError = $state<string>();
+	let isLoadingModels = $state(false);
 
 	$effect(() => {
 		let disposed = false;
@@ -67,6 +78,40 @@
 			isPending = false;
 		}
 	}
+
+	async function loadModels() {
+		if (isLoadingModels) {
+			return;
+		}
+
+		isLoadingModels = true;
+		modelsError = undefined;
+
+		try {
+			models = await invoke<OllamaModel[]>('list_ollama_models');
+		} catch (caughtError) {
+			modelsError = caughtError instanceof Error ? caughtError.message : String(caughtError);
+		} finally {
+			isLoadingModels = false;
+		}
+	}
+
+	function formatSize(bytes: number) {
+		const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+		let value = bytes;
+		let unitIndex = 0;
+
+		while (value >= 1024 && unitIndex < units.length - 1) {
+			value /= 1024;
+			unitIndex += 1;
+		}
+
+		return `${value.toLocaleString(undefined, { maximumFractionDigits: 1 })} ${units[unitIndex]}`;
+	}
+
+onMount(async () => {
+	void await loadModels();
+});
 </script>
 
 <h1>Local Models Orchestrators</h1>
@@ -101,3 +146,37 @@
 {#if error}
 	<p role="alert">Unable to send message: {error}</p>
 {/if}
+
+<section aria-labelledby="ollama-models-heading">
+	<h2 id="ollama-models-heading">Installed Ollama models</h2>
+	<button type="button" onclick={() => void loadModels()} disabled={isLoadingModels}>
+		{isLoadingModels ? 'Loading models…' : 'Refresh models'}
+	</button>
+
+	{#if modelsError}
+		<p role="alert">Unable to load Ollama models: {modelsError}</p>
+	{:else if isLoadingModels}
+		<p aria-live="polite">Loading installed Ollama models…</p>
+	{:else if models.length === 0}
+		<p>No Ollama models are installed.</p>
+	{:else}
+		<table>
+			<thead>
+				<tr>
+					<th scope="col">Name</th>
+					<th scope="col">Size</th>
+					<th scope="col">Modified</th>
+				</tr>
+			</thead>
+			<tbody>
+				{#each models as model (model.name)}
+					<tr>
+						<td>{model.name}</td>
+						<td>{formatSize(model.size)}</td>
+						<td>{new Date(model.modifiedAt).toLocaleString()}</td>
+					</tr>
+				{/each}
+			</tbody>
+		</table>
+	{/if}
+</section>
