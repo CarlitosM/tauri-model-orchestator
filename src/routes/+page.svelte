@@ -19,6 +19,11 @@
 		modifiedAt: string;
 	};
 
+	type NonStreamChatResponse = {
+		model: string;
+		content: string;
+	};
+
 	let message = $state('');
 	let response = $state<EchoResponse>();
 	let listenerReady = $state(false);
@@ -28,6 +33,11 @@
 	let models = $state<OllamaModel[]>([]);
 	let modelsError = $state<string>();
 	let isLoadingModels = $state(false);
+	let selectedModel = $state<string>();
+	let chatPrompt = $state('');
+	let chatResponse = $state<NonStreamChatResponse>();
+	let isChatPending = $state(false);
+	let chatError = $state<string>();
 
 	$effect(() => {
 		let disposed = false;
@@ -76,6 +86,29 @@
 		} catch (caughtError) {
 			error = caughtError instanceof Error ? caughtError.message : String(caughtError);
 			isPending = false;
+		}
+	}
+
+	async function sendChat() {
+		const trimmedPrompt = chatPrompt.trim();
+
+		if (!trimmedPrompt || !selectedModel || isChatPending) {
+			return;
+		}
+
+		isChatPending = true;
+		chatError = undefined;
+		chatResponse = undefined;
+
+		try {
+			chatResponse = await invoke<NonStreamChatResponse>('non_stream_chat', {
+				model: selectedModel,
+				message: trimmedPrompt
+			});
+		} catch (caughtError) {
+			chatError = caughtError instanceof Error ? caughtError.message : String(caughtError);
+		} finally {
+			isChatPending = false;
 		}
 	}
 
@@ -147,8 +180,49 @@ onMount(async () => {
 	<p role="alert">Unable to send message: {error}</p>
 {/if}
 
+<section aria-labelledby="chat-heading">
+	<h2 id="chat-heading">Chat</h2>
+
+	<form
+		onsubmit={(event) => {
+			event.preventDefault();
+			void sendChat();
+		}}
+	>
+		<label for="chat-prompt">Prompt</label>
+		<textarea
+			id="chat-prompt"
+			rows="4"
+			bind:value={chatPrompt}
+			disabled={!selectedModel || isChatPending}
+			placeholder={selectedModel ? 'Type a prompt…' : 'Select a model first'}
+		></textarea>
+		<button type="submit" disabled={!chatPrompt.trim() || !selectedModel || isChatPending}>
+			{isChatPending ? 'Waiting for response…' : 'Send'}
+		</button>
+	</form>
+
+	{#if chatError}
+		<p role="alert">Error: {chatError}</p>
+	{/if}
+
+	{#if chatResponse}
+		<section aria-live="polite">
+			<h3>{chatResponse.model}</h3>
+			<p>{chatResponse.content}</p>
+		</section>
+	{/if}
+</section>
+
 <section aria-labelledby="ollama-models-heading">
 	<h2 id="ollama-models-heading">Installed Ollama models</h2>
+
+	{#if selectedModel}
+		<p>Selected model: <strong>{selectedModel}</strong></p>
+	{:else}
+		<p>No model selected.</p>
+	{/if}
+
 	<button type="button" onclick={() => void loadModels()} disabled={isLoadingModels}>
 		{isLoadingModels ? 'Loading models…' : 'Refresh models'}
 	</button>
@@ -163,6 +237,7 @@ onMount(async () => {
 		<table>
 			<thead>
 				<tr>
+					<th scope="col">Select</th>
 					<th scope="col">Name</th>
 					<th scope="col">Size</th>
 					<th scope="col">Modified</th>
@@ -171,7 +246,16 @@ onMount(async () => {
 			<tbody>
 				{#each models as model (model.name)}
 					<tr>
-						<td>{model.name}</td>
+						<td>
+							<input
+								type="radio"
+								name="model-select"
+								id="model-{model.name}"
+								value={model.name}
+								bind:group={selectedModel}
+							/>
+						</td>
+						<td><label for="model-{model.name}">{model.name}</label></td>
 						<td>{formatSize(model.size)}</td>
 						<td>{new Date(model.modifiedAt).toLocaleString()}</td>
 					</tr>
