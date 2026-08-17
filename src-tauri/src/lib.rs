@@ -1,26 +1,30 @@
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Listener};
 
-const ECHO_REQUEST_EVENT: &str = "frontend-echo-request";
-const ECHO_RESPONSE_EVENT: &str = "backend-echo-response";
+const STREAMING_CHAT_EVENT: &str = "streaming-chat";
+const STREAMING_CHAT_RESPONSE_EVENT: &str = "streaming-chat-response";
 const OLLAMA_TAGS_URL: &str = "http://127.0.0.1:11434/api/tags";
 const OLLAMA_CHAT_URL: &str = "http://127.0.0.1:11434/api/chat";
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct EchoRequest {
+struct StreamingChatRequest {
     request_id: String,
+    model: String,
     message: String,
 }
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct EchoResponse {
+struct StreamingChatResponse {
     request_id: String,
-    message: String,
-    received_at: u64,
+    model: String,
+    content: String,
+    done: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -60,6 +64,7 @@ struct OllamaChatMessage {
 struct OllamaChatResponse {
     model: String,
     message: OllamaChatMessage,
+    done: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -151,6 +156,206 @@ async fn non_stream_chat(model: String, message: String) -> Result<NonStreamChat
     })
 }
 
+fn emit_stream_response(app_handle: &tauri::AppHandle, response: StreamingChatResponse) -> bool {
+    if let Err(error) = app_handle.emit_to("main", STREAMING_CHAT_RESPONSE_EVENT, response) {
+        log::error!("Could not emit streaming chat response: {error}");
+        return false;
+    }
+
+    true
+}
+
+fn emit_stream_error(
+    app_handle: &tauri::AppHandle,
+    request_id: &str,
+    model: &str,
+    error: impl Into<String>,
+) {
+    let _ = emit_stream_response(
+        app_handle,
+        StreamingChatResponse {
+            request_id: request_id.to_owned(),
+            model: model.to_owned(),
+            content: String::new(),
+            done: true,
+            error: Some(error.into()),
+        },
+    );
+}
+
+fn take_ndjson_records(buffer: &mut Vec<u8>) -> Vec<Vec<u8>> {
+    let mut records = Vec::new();
+
+    while let Some(end) = buffer.iter().position(|byte| *byte == b'\n') {
+        records.push(buffer.drain(..=end).collect());
+    }
+
+    records
+}
+
+fn forward_stream_record(
+    app_handle: &tauri::AppHandle,
+    request_id: &str,
+    record: &[u8],
+) -> Result<bool, String> {
+    if record.iter().all(u8::is_ascii_whitespace) {
+        return Ok(false);
+    }
+
+    let response = serde_json::from_slice::<OllamaChatResponse>(record)
+        .map_err(|error| format!("Could not read Ollama's streaming chat response: {error}"))?;
+    let done = response.done;
+    let response = StreamingChatResponse {
+        request_id: request_id.to_owned(),
+        model: response.model,
+        content: response.message.content,
+        done,
+        error: None,
+    };
+
+    if !emit_stream_response(app_handle, response) {
+        return Err("Could not deliver Ollama's streaming response to the frontend.".to_owned());
+    }
+
+    Ok(done)
+}
+
+async fn stream_chat(app_handle: tauri::AppHandle, request: StreamingChatRequest) {
+    let request_id = request.request_id.trim().to_owned();
+    let model = request.model.trim().to_owned();
+    let message = request.message.trim().to_owned();
+
+    if request_id.is_empty() {
+        emit_stream_error(
+            &app_handle,
+            &request_id,
+            &model,
+            "A request ID is required for streaming chat.",
+        );
+        return;
+    }
+
+    if model.is_empty() {
+        emit_stream_error(
+            &app_handle,
+            &request_id,
+            &model,
+            "Select an Ollama model before sending a chat message.",
+        );
+        return;
+    }
+
+    if message.is_empty() {
+        emit_stream_error(
+            &app_handle,
+            &request_id,
+            &model,
+            "Enter a chat message before sending it.",
+        );
+        return;
+    }
+
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(300))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            emit_stream_error(
+                &app_handle,
+                &request_id,
+                &model,
+                format!("Could not configure the Ollama client: {error}"),
+            );
+            return;
+        }
+    };
+    let request = OllamaChatRequest {
+        model: model.clone(),
+        messages: vec![OllamaChatMessage {
+            role: "user".to_owned(),
+            content: message,
+        }],
+        stream: true,
+    };
+
+    let mut response = match client.post(OLLAMA_CHAT_URL).json(&request).send().await {
+        Ok(response) => response,
+        Err(error) => {
+            emit_stream_error(
+                &app_handle,
+                &request_id,
+                &model,
+                format!(
+                    "Could not connect to Ollama at 127.0.0.1:11434. Make sure Ollama is running: {error}"
+                ),
+            );
+            return;
+        }
+    };
+
+    response = match response.error_for_status() {
+        Ok(response) => response,
+        Err(error) => {
+            emit_stream_error(
+                &app_handle,
+                &request_id,
+                &model,
+                format!("Ollama returned an unsuccessful response: {error}"),
+            );
+            return;
+        }
+    };
+
+    let mut buffer = Vec::new();
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                buffer.extend_from_slice(&chunk);
+
+                for record in take_ndjson_records(&mut buffer) {
+                    match forward_stream_record(&app_handle, &request_id, &record) {
+                        Ok(true) => return,
+                        Ok(false) => {}
+                        Err(error) => {
+                            emit_stream_error(&app_handle, &request_id, &model, error);
+                            return;
+                        }
+                    }
+                }
+            }
+            Ok(None) => break,
+            Err(error) => {
+                emit_stream_error(
+                    &app_handle,
+                    &request_id,
+                    &model,
+                    format!("Could not read Ollama's streaming response: {error}"),
+                );
+                return;
+            }
+        }
+    }
+
+    if !buffer.iter().all(u8::is_ascii_whitespace) {
+        match forward_stream_record(&app_handle, &request_id, &buffer) {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(error) => {
+                emit_stream_error(&app_handle, &request_id, &model, error);
+                return;
+            }
+        }
+    }
+
+    emit_stream_error(
+        &app_handle,
+        &request_id,
+        &model,
+        "Ollama ended the streaming response without a completion record.",
+    );
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -168,32 +373,16 @@ pub fn run() {
             }
 
             let app_handle = app.handle().clone();
-            app.listen(ECHO_REQUEST_EVENT, move |event| {
-                let request = match serde_json::from_str::<EchoRequest>(event.payload()) {
-                    Ok(request) if !request.message.trim().is_empty() => request,
-                    Ok(_) => {
-                        log::warn!("Ignoring an empty echo request");
-                        return;
-                    }
+            app.listen(STREAMING_CHAT_EVENT, move |event| {
+                let request = match serde_json::from_str::<StreamingChatRequest>(event.payload()) {
+                    Ok(request) => request,
                     Err(error) => {
-                        log::warn!("Ignoring malformed echo request: {error}");
+                        log::warn!("Ignoring malformed streaming chat request: {error}");
                         return;
                     }
                 };
 
-                let received_at = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|duration| duration.as_millis().try_into().unwrap_or(u64::MAX))
-                    .unwrap_or_default();
-                let response = EchoResponse {
-                    request_id: request.request_id,
-                    message: request.message,
-                    received_at,
-                };
-
-                if let Err(error) = app_handle.emit_to("main", ECHO_RESPONSE_EVENT, response) {
-                    log::error!("Could not emit echo response: {error}");
-                }
+                tauri::async_runtime::spawn(stream_chat(app_handle.clone(), request));
             });
 
             Ok(())
@@ -204,7 +393,10 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{OllamaChatRequest, OllamaChatResponse, OllamaTagsResponse};
+    use super::{
+        take_ndjson_records, OllamaChatRequest, OllamaChatResponse, OllamaTagsResponse,
+        StreamingChatResponse,
+    };
 
     #[test]
     fn deserializes_ollama_tags_response() {
@@ -251,6 +443,22 @@ mod tests {
     }
 
     #[test]
+    fn serializes_a_streaming_chat_request() {
+        let request = OllamaChatRequest {
+            model: "llama3.2:latest".to_owned(),
+            messages: vec![super::OllamaChatMessage {
+                role: "user".to_owned(),
+                content: "Hello".to_owned(),
+            }],
+            stream: true,
+        };
+
+        let value = serde_json::to_value(request).expect("chat request should serialize");
+
+        assert_eq!(value["stream"], true);
+    }
+
+    #[test]
     fn deserializes_a_non_streaming_chat_response() {
         let response = serde_json::from_str::<OllamaChatResponse>(
             r#"{
@@ -263,5 +471,47 @@ mod tests {
 
         assert_eq!(response.model, "llama3.2:latest");
         assert_eq!(response.message.content, "Hi there!");
+        assert!(response.done);
+    }
+
+    #[test]
+    fn buffers_ndjson_records_across_transport_chunks() {
+        let mut buffer = b"{\"model\":\"llama\",\"message\":{\"role\":\"assistant\",\"content\":\"Hi\"},\"done\":false}\n{\"model\":\"llama\"".to_vec();
+
+        let records = take_ndjson_records(&mut buffer);
+
+        assert_eq!(records.len(), 1);
+        assert!(buffer.starts_with(b"{\"model\":\"llama\""));
+
+        buffer.extend_from_slice(
+            b",\"message\":{\"role\":\"assistant\",\"content\":\"!\"},\"done\":true}\n",
+        );
+        let records = take_ndjson_records(&mut buffer);
+
+        assert_eq!(records.len(), 1);
+        assert!(buffer.is_empty());
+        let response = serde_json::from_slice::<OllamaChatResponse>(&records[0])
+            .expect("streaming record should deserialize");
+        assert_eq!(response.message.content, "!");
+        assert!(response.done);
+    }
+
+    #[test]
+    fn serializes_a_terminal_streaming_error_response() {
+        let response = StreamingChatResponse {
+            request_id: "request-1".to_owned(),
+            model: "llama3.2:latest".to_owned(),
+            content: String::new(),
+            done: true,
+            error: Some("Ollama is unavailable".to_owned()),
+        };
+
+        let value = serde_json::to_value(response).expect("streaming response should serialize");
+
+        assert_eq!(value["requestId"], "request-1");
+        assert_eq!(value["model"], "llama3.2:latest");
+        assert_eq!(value["content"], "");
+        assert_eq!(value["done"], true);
+        assert_eq!(value["error"], "Ollama is unavailable");
     }
 }

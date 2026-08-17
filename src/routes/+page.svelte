@@ -24,6 +24,20 @@
 		content: string;
 	};
 
+	type StreamingChatRequest = {
+		requestId: string;
+		model: string;
+		message: string;
+	};
+
+	type StreamingChatResponse = {
+		requestId: string;
+		model: string;
+		content: string;
+		done: boolean;
+		error?: string;
+	};
+
 	let message = $state('');
 	let response = $state<EchoResponse>();
 	let listenerReady = $state(false);
@@ -38,6 +52,14 @@
 	let chatResponse = $state<NonStreamChatResponse>();
 	let isChatPending = $state(false);
 	let chatError = $state<string>();
+
+	let streamPrompt = $state('');
+	let streamContent = $state('');
+	let streamModel = $state('');
+	let isStreaming = $state(false);
+	let streamError = $state<string>();
+	let streamListenerReady = $state(false);
+	let currentStreamRequestId = $state<string>();
 
 	$effect(() => {
 		let disposed = false;
@@ -64,6 +86,50 @@
 			void unlistenPromise.then((unlisten) => unlisten());
 		};
 	});
+
+	$effect(() => {
+		let disposed = false;
+		const unlistenPromise = getCurrentWebviewWindow().listen<StreamingChatResponse>(
+			'streaming-chat-response',
+			(event) => {
+				const payload = event.payload;
+
+				// Ignore stale events from a previous request
+				if (payload.requestId !== currentStreamRequestId) return;
+
+				if (payload.error) {
+					streamError = payload.error;
+					isStreaming = false;
+					currentStreamRequestId = undefined;
+					return;
+				}
+
+				streamContent += payload.content;
+				streamModel = payload.model;
+
+				if (payload.done) {
+					isStreaming = false;
+					currentStreamRequestId = undefined;
+				}
+			}
+		);
+
+		void unlistenPromise.then((unlisten) => {
+			if (disposed) {
+				unlisten();
+				return;
+			}
+
+			streamListenerReady = true;
+		});
+
+		return () => {
+			disposed = true;
+			streamListenerReady = false;
+			void unlistenPromise.then((unlisten) => unlisten());
+		};
+	});
+
 
 	async function sendEcho() {
 		const trimmedMessage = message.trim();
@@ -111,6 +177,36 @@
 			isChatPending = false;
 		}
 	}
+
+	async function sendStreamChat() {
+		const trimmedPrompt = streamPrompt.trim();
+
+		if (!trimmedPrompt || !selectedModel || isStreaming || !streamListenerReady) {
+			return;
+		}
+
+		const requestId = `${Date.now()}-${++requestNumber}`;
+		currentStreamRequestId = requestId;
+		isStreaming = true;
+		streamError = undefined;
+		streamContent = '';
+		streamModel = '';
+
+		const request: StreamingChatRequest = {
+			requestId,
+			model: selectedModel,
+			message: trimmedPrompt
+		};
+
+		try {
+			await emit('streaming-chat', request);
+		} catch (caughtError) {
+			streamError = caughtError instanceof Error ? caughtError.message : String(caughtError);
+			isStreaming = false;
+			currentStreamRequestId = undefined;
+		}
+	}
+
 
 	async function loadModels() {
 		if (isLoadingModels) {
@@ -213,6 +309,50 @@ onMount(async () => {
 		</section>
 	{/if}
 </section>
+
+<section aria-labelledby="stream-chat-heading">
+	<h2 id="stream-chat-heading">Streaming Chat</h2>
+
+	<p aria-live="polite">
+		{streamListenerReady ? 'Stream bridge connected.' : 'Connecting stream bridge…'}
+	</p>
+
+	<form
+		onsubmit={(event) => {
+			event.preventDefault();
+			void sendStreamChat();
+		}}
+	>
+		<label for="stream-prompt">Prompt</label>
+		<textarea
+			id="stream-prompt"
+			rows="4"
+			bind:value={streamPrompt}
+			disabled={!selectedModel || isStreaming}
+			placeholder={selectedModel ? 'Type a streaming prompt…' : 'Select a model first'}
+		></textarea>
+		<button
+			type="submit"
+			disabled={!streamPrompt.trim() || !selectedModel || isStreaming || !streamListenerReady}
+		>
+			{isStreaming ? 'Streaming…' : 'Send (stream)'}
+		</button>
+	</form>
+
+	{#if streamError}
+		<p role="alert">Stream error: {streamError}</p>
+	{/if}
+
+	{#if streamContent || isStreaming}
+		<section aria-live="polite">
+			{#if streamModel}
+				<h3>{streamModel}</h3>
+			{/if}
+			<p style="white-space: pre-wrap">{streamContent}{isStreaming ? '▍' : ''}</p>
+		</section>
+	{/if}
+</section>
+
 
 <section aria-labelledby="ollama-models-heading">
 	<h2 id="ollama-models-heading">Installed Ollama models</h2>
