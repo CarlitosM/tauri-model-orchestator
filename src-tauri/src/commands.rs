@@ -4,8 +4,7 @@ use crate::ollama::{
 };
 use serde::Serialize;
 
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Serialize)]
 pub struct ListModelsResponse(Vec<OllamaTag>);
 
 #[tauri::command]

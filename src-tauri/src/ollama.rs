@@ -43,9 +43,7 @@ pub struct OllamaChatRequest {
     pub messages: Vec<OllamaChatMessage>,
 }
 
-pub async fn get_ollama_chat(
-    chat: OllamaChatRequest,
-) -> Result<OllamaChatResponse, AppError> {
+pub async fn get_ollama_chat(chat: OllamaChatRequest) -> Result<OllamaChatResponse, AppError> {
     let client = reqwest::Client::new();
     let url = format!("{}{}", OLLAMA_API_BASE_URL, OLLAMA_CHAT_ENDPOINT);
     let body =
@@ -55,10 +53,7 @@ pub async fn get_ollama_chat(
     Ok(chat_response)
 }
 
-pub async fn stream_ollama_chat<F>(
-    chat: OllamaChatRequest,
-    mut handler: F,
-) -> Result<(), AppError>
+pub async fn stream_ollama_chat<F>(chat: OllamaChatRequest, mut handler: F) -> Result<(), AppError>
 where
     F: FnMut(OllamaChatResponse) -> Result<(), AppError>,
 {

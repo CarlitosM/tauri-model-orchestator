@@ -33,7 +33,7 @@
 					</td>
 					<td><label for="model-{model.name}">{model.name}</label></td>
 					<td>{formatSize(model.size)}</td>
-					<td>{new Date(model.modifiedAt).toLocaleString()}</td>
+					<td>{(new Intl.DateTimeFormat("en-US").format(new Date(model.modified_at)))}</td>
 				</tr>
 			{/each}
 		</tbody>

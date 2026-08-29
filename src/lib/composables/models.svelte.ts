@@ -3,7 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 export type OllamaModel = {
 	name: string;
 	size: number;
-	modifiedAt: string;
+	modified_at: string;
 };
 
 class ModelsStore {
@@ -14,7 +14,7 @@ class ModelsStore {
 
 	haveModels = $derived(this.models.length > 0);
 	hasError = $derived(Boolean(this.errorMessage));
-	validSelectedModel = $derived(this.models.some(({ name }) => name === this.selectedModel));
+  validSelectedModel = $derived(this.models.some(({ name }) => name === this.selectedModel));
 
 	async loadModels() {
 		if (this.isLoading) {
@@ -25,7 +25,7 @@ class ModelsStore {
 		this.errorMessage = '';
 
 		try {
-			this.models = await invoke<OllamaModel[]>('list_models');
+      this.models = await invoke<OllamaModel[]>('list_models');
 		} catch (caughtError) {
 			this.errorMessage = caughtError instanceof Error ? caughtError.message : String(caughtError);
 		} finally {
